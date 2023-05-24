@@ -9,6 +9,10 @@ from sklearn.metrics import mean_squared_error
 from sklearn.metrics import r2_score
 
 import math
+from pathlib import Path
+from datetime import datetime
+
+import wandb
 
 COL_NAMES = ['Danceability', 'Energy', 'Key', 'Loudness', 'Speechiness', 'Acousticness', 'Instrumentalness', 'Liveness', 'Valence', 'Tempo', 'Duration_ms', 'Views', 'Likes', 'Stream', 'Album_type', 'Licensed', 'official_video', 'id', 'Track', 'Album', 'Uri', 'Url_spotify', 'Url_youtube', 'Comments', 'Description', 'Title', 'Channel', 'Composer', 'Artist']
 ID = 'id'
@@ -30,14 +34,17 @@ def parse_args() -> Namespace:
         default="./data/test.csv",
     )
     parser.add_argument(
-        "--output_file",
-        type=str,
-        default="./pred.csv",
+        "--output_dir",
+        type=Path,
+        help="Directory to save the model file.",
+        default="./models/",
     )
+    parser.add_argument("--only_eval", action="store_true")
     parser.add_argument("--num_proc", type=int, default=2)
     
     # Training arguments
     parser.add_argument("--base_model", type=str, default="bert-base-uncased")
+    parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--max_length", type=float, default=256)
     parser.add_argument("--batch", type=int, default=16)
@@ -68,6 +75,7 @@ def read_data(args):
         test_data.drop(name, axis=1, inplace=True)
         train_data.drop(name, axis=1, inplace=True)
 
+    test_data[ID] = test_data[ID].astype("int32")
     return train_data, test_data
     
 def preprocess_function(examples, tokenizer, max_length):
@@ -82,7 +90,7 @@ def preprocess_function(examples, tokenizer, max_length):
     #     text += f'{name}: {examples[name]}. '
     
     processed_examples = tokenizer(text, truncation=True, padding="max_length", max_length=max_length)
-    
+    processed_examples["text"] = text
     # Change this to real number
     if LABEL in examples:
         label = examples[LABEL]
@@ -108,6 +116,10 @@ def compute_metrics_for_regression(eval_pred):
 
 class RegressionTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
+        
+        # print(f"inputs: {inputs}")
+        # print(f"return_outputs: {return_outputs}")
+
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs[0][:, 0]
@@ -135,7 +147,8 @@ def main(args):
     #  Model  #
     ###########
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
-    model = AutoModelForSequenceClassification.from_pretrained(args.base_model, num_labels=1)  
+    model_path = args.base_model if args.checkpoint is None else args.checkpoint
+    model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=1)  
     for split in ds:
         print(f"Mapping {split} split.")
         ds[split] = ds[split].map(
@@ -148,7 +161,7 @@ def main(args):
     #  Train  #
     ###########
     training_args = TrainingArguments(
-        output_dir=f"models/{args.base_model}",
+        output_dir=args.repo_dir,
         learning_rate=args.lr,
         per_device_train_batch_size=args.batch,
         per_device_eval_batch_size=args.batch,
@@ -167,8 +180,8 @@ def main(args):
         eval_dataset=ds["validation"],
         compute_metrics=compute_metrics_for_regression,
     )
-
-    trainer.train()
+    if not args.only_eval:
+        trainer.train()
 
     ####################
     #  Test Statistic  #
@@ -177,19 +190,32 @@ def main(args):
     trainer.evaluate()
 
     # Output prediction
-    nb_batches = math.ceil(len(raw_test_ds)/BATCH_SIZE)
+    nb_batches = math.ceil(len(ds["test"])/args.batch)
     y_preds = []
 
     for i in range(nb_batches):
-        input_texts = raw_test_ds[i * BATCH_SIZE: (i+1) * BATCH_SIZE]["text"]
-        input_labels = raw_test_ds[i * BATCH_SIZE: (i+1) * BATCH_SIZE]["score"]
+        input_texts = ds["test"][i * args.batch: (i+1) * args.batch]["text"]
+        # input_labels = raw_test_ds[i * args.batch: (i+1) * args.batch][LABEL]
         encoded = tokenizer(input_texts, truncation=True, padding="max_length", max_length=256, return_tensors="pt").to("cuda")
         y_preds += model(**encoded).logits.reshape(-1).tolist()
 
-    df = pd.DataFrame([raw_test_ds[ID], y_preds], [ID, "Prediction"]).T
-    df[LABEL] = df["Prediction"].apply(round)
-    df.to_csv(args.output_file)
+    df = pd.DataFrame([ds["test"][ID], y_preds], [ID, "Prediction"]).T
+    df[LABEL] = df["Prediction"].apply(round) 
+    df.drop("Prediction", axis=1, inplace=True)
+    df.to_csv(args.repo_dir / "pred.csv", index=False)
 
 if __name__ == "__main__":
     args = parse_args()
+    time = datetime.now().strftime('%Y%m%d-%H%M%S')
+    args.repo_dir = args.output_dir / time
+
+
+    # start a new wandb run to track this script
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project="NTU-ML-Final",
+        # track hyperparameters and run metadata
+        config=args
+    )
+
     main(args)
