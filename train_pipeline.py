@@ -23,6 +23,7 @@ from tqdm import trange
 COL_NAMES = ['Danceability', 'Energy', 'Key', 'Loudness', 'Speechiness', 'Acousticness', 'Instrumentalness', 'Liveness', 'Valence', 'Tempo', 'Duration_ms', 'Views', 'Likes', 'Stream', 'Album_type', 'Licensed', 'official_video', 'id', 'Track', 'Album', 'Uri', 'Url_spotify', 'Url_youtube', 'Comments', 'Description', 'Title', 'Channel', 'Composer', 'Artist']
 ID = 'id'
 LABEL = 'Danceability'
+# TODO: Feature selection.
 NUM_COL_NAMES = ['Energy','Key','Loudness','Speechiness','Acousticness','Instrumentalness','Liveness','Valence','Tempo','Duration_ms','Views','Likes','Stream']
 STR_COL_NAMES = ["Description", "Artist", "Composer", "Album", "Track"]
 
@@ -102,9 +103,9 @@ def preprocess_function(examples, tokenizer, max_length):
     # Change this to real number
     if LABEL in examples:
         label = examples[LABEL]
-        # examples["labels"] = torch.tensor(label, dtype=torch.float32)
         processed_examples["labels"] = float(label)
     
+    processed_examples["related_features"] = [examples[name] for name in NUM_COL_NAMES]
     return processed_examples
 
 def compute_metrics_for_regression(eval_pred):
@@ -124,18 +125,10 @@ def compute_metrics_for_regression(eval_pred):
 
 class RegressionTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
-        print("compute_loss.inputs")
-        print(inputs)
         labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        print("outputs")
-        print(outputs)
-        print("outputs[0].shape")
-        print(outputs[0].shape)
-        logits = outputs[0][:, 0]
+        outputs = model(**inputs)   
+        logits = outputs["logits"][:, 0]
         loss = torch.nn.functional.mse_loss(logits, labels)
-        print("loss")
-        print(loss)
         return (loss, outputs) if return_outputs else loss
 
 def main(args):
@@ -161,7 +154,7 @@ def main(args):
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     model_path = args.base_model if args.checkpoint is None else args.checkpoint
     # model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=1)  
-    model = CustomedModel(CustomedConfig(encoder_model_path=model_path))
+    model = CustomedModel(CustomedConfig(encoder_model_path=model_path, related_features_dim=len(NUM_COL_NAMES)))
     for split in ds:
         print(f"Mapping {split} split.")
         ds[split] = ds[split].map(
@@ -215,6 +208,7 @@ def main(args):
         y_preds += model(**encoded).logits.reshape(-1).tolist()
 
     df = pd.DataFrame([ds["test"][ID], y_preds], [ID, "Prediction"]).T
+    df[ID] = df[ID].apply(round) 
     df[LABEL] = df["Prediction"].apply(round) 
     df.drop("Prediction", axis=1, inplace=True)
     df.to_csv(args.repo_dir / "pred.csv", index=False)

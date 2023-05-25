@@ -94,7 +94,6 @@ def preprocess_function(examples, tokenizer, max_length):
     # Change this to real number
     if LABEL in examples:
         label = examples[LABEL]
-        # examples["labels"] = torch.tensor(label, dtype=torch.float32)
         processed_examples["labels"] = float(label)
     
     return processed_examples
@@ -116,10 +115,6 @@ def compute_metrics_for_regression(eval_pred):
 
 class RegressionTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
-        
-        # print(f"inputs: {inputs}")
-        # print(f"return_outputs: {return_outputs}")
-
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs[0][:, 0]
@@ -200,6 +195,7 @@ def main(args):
         y_preds += model(**encoded).logits.reshape(-1).tolist()
 
     df = pd.DataFrame([ds["test"][ID], y_preds], [ID, "Prediction"]).T
+    df[ID] = df[ID].apply(round) 
     df[LABEL] = df["Prediction"].apply(round) 
     df.drop("Prediction", axis=1, inplace=True)
     df.to_csv(args.repo_dir / "pred.csv", index=False)
