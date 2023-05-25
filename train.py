@@ -203,8 +203,8 @@ def main(args):
 if __name__ == "__main__":
     args = parse_args()
     time = datetime.now().strftime('%Y%m%d-%H%M%S')
+    args.output_dir.mkdir(parents=True, exist_ok=True)
     args.repo_dir = args.output_dir / time
-
 
     # start a new wandb run to track this script
     wandb.init(

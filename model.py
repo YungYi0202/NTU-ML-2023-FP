@@ -6,7 +6,7 @@ import torch
 
 class CustomedConfig(PretrainedConfig):
     def __init__(self,
-                 encoder_model: str = "bert-base-uncased",
+                 encoder_model: str = None,
                  related_features_dim: int = 13,
                  num_labels: int = 1,
                  inner_dim: int = 1024,
@@ -29,6 +29,7 @@ class CustomedModel(PreTrainedModel):
     ):
         super(CustomedModel, self).__init__(config)
         self.encoder = AutoModelForSequenceClassification.from_pretrained(self.config.encoder_model_path, num_labels=self.config.num_labels) 
+        print(f"Encoder is loaded from {self.config.encoder_model_path}")
         self.hidden_dim = self.config.num_labels + self.config.related_features_dim
         # TODO: Change fully connected layers.
         self.fc_layers = torch.nn.Sequential(
@@ -39,11 +40,12 @@ class CustomedModel(PreTrainedModel):
     
     def forward(
         self,
-        input_ids=None,
-        token_type_ids=None,
-        attention_mask=None,
+        input_ids,
+        token_type_ids,
+        attention_mask,
+        related_features,
         labels=None,
-        related_features=None,
+        **kwargs
     ):
         # input_ids.shape = (batch, max_length)
         # related_features.shape = (batch, related_features_dim)

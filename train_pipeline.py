@@ -52,7 +52,8 @@ def parse_args() -> Namespace:
     parser.add_argument("--num_proc", type=int, default=2)
     
     # Training arguments
-    parser.add_argument("--base_model", type=str, default="bert-base-uncased")
+    parser.add_argument("--encoder_model", type=str, default="bert-base-uncased")
+    parser.add_argument("--encoder_checkpoint", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--max_length", type=float, default=256)
@@ -110,6 +111,8 @@ def preprocess_function(examples, tokenizer, max_length):
 
 def compute_metrics_for_regression(eval_pred):
     logits, labels = eval_pred
+    # logits is a tuple
+    logits = logits[0]
     labels = labels.reshape(-1, 1)
     
     mse = mean_squared_error(labels, logits)
@@ -151,10 +154,14 @@ def main(args):
     ###########
     #  Model  #
     ###########
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
-    model_path = args.base_model if args.checkpoint is None else args.checkpoint
-    # model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=1)  
-    model = CustomedModel(CustomedConfig(encoder_model_path=model_path, related_features_dim=len(NUM_COL_NAMES)))
+    tokenizer = AutoTokenizer.from_pretrained(args.encoder_model)
+    if args.checkpoint is None:
+        model_path = args.encoder_model if args.encoder_checkpoint is None else args.encoder_checkpoint
+        model = CustomedModel(CustomedConfig(encoder_model_path=model_path, related_features_dim=len(NUM_COL_NAMES)))
+    else:
+        config = CustomedConfig.from_pretrained(args.checkpoint)
+        model = CustomedModel(config)
+        
     for split in ds:
         print(f"Mapping {split} split.")
         ds[split] = ds[split].map(
@@ -202,10 +209,8 @@ def main(args):
     y_preds = []
 
     for i in range(nb_batches):
-        input_texts = ds["test"][i * args.batch: (i+1) * args.batch]["text"]
-        # input_labels = raw_test_ds[i * args.batch: (i+1) * args.batch][LABEL]
-        encoded = tokenizer(input_texts, truncation=True, padding="max_length", max_length=256, return_tensors="pt").to("cuda")
-        y_preds += model(**encoded).logits.reshape(-1).tolist()
+        inputs = ds["test"][i * args.batch: (i+1) * args.batch]
+        y_preds += model(**inputs).logits.reshape(-1).tolist()
 
     df = pd.DataFrame([ds["test"][ID], y_preds], [ID, "Prediction"]).T
     df[ID] = df[ID].apply(round) 
