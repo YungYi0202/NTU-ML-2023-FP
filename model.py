@@ -1,20 +1,10 @@
 from dataclasses import dataclass
-from transformers import PretrainedConfig, PreTrainedModel, AutoModelForSequenceClassification
 from transformers.modeling_outputs import ModelOutput
 from typing import Optional
 import torch
-
-class CustomedConfig(PretrainedConfig):
-    def __init__(self,
-                 encoder_model: str = None,
-                 related_features_dim: int = 13,
-                 num_labels: int = 1,
-                 inner_dim: int = 1024,
-                 **kwargs):
-        super(CustomedConfig, self).__init__(num_labels=num_labels, **kwargs)
-        self.encoder_model = encoder_model
-        self.related_features_dim = related_features_dim
-        self.inner_dim = inner_dim
+import torch.nn as nn
+from transformers import AutoModelForSequenceClassification
+import os
 
 @dataclass
 class CustomedOutput(ModelOutput):
@@ -22,28 +12,42 @@ class CustomedOutput(ModelOutput):
     logits: torch.FloatTensor = None
     encoder_logits: torch.FloatTensor = None
 
-class CustomedModel(PreTrainedModel):
+class CustomedModel(nn.Module):
     def __init__(
         self,
-        config: CustomedConfig
+        encoder_name_or_path=None,
+        num_classes=1,
+        related_features_dim=14,
+        fc_layers=[1024]
     ):
-        super(CustomedModel, self).__init__(config)
-        self.encoder = AutoModelForSequenceClassification.from_pretrained(self.config.encoder_model_path, num_labels=self.config.num_labels) 
-        print(f"Encoder is loaded from {self.config.encoder_model_path}")
-        self.hidden_dim = self.config.num_labels + self.config.related_features_dim
-        # TODO: Change fully connected layers.
-        self.fc_layers = torch.nn.Sequential(
-                torch.nn.Linear(self.hidden_dim, self.config.inner_dim),
-                torch.nn.LeakyReLU(inplace=True),
-                torch.nn.Linear(self.config.inner_dim, self.config.num_labels),
-            )
-    
+        super(CustomedModel, self).__init__()
+        self.num_classes = num_classes
+        self.related_features_dim = related_features_dim
+        self.fc_layers_size = fc_layers
+        if encoder_name_or_path is not None:
+            self._init(encoder_name_or_path)
+        
+    def _init(self, encoder_name_or_path):
+        self.encoder = AutoModelForSequenceClassification.from_pretrained(encoder_name_or_path, num_labels=self.num_classes)
+        self.hidden_size = len(self.encoder.config.id2label) + self.related_features_dim
+        
+        self.fc_layers = nn.ModuleList()
+        prev_size = self.hidden_size
+        
+        # Add fully connected layers
+        for fc_size in self.fc_layers_size:
+            self.fc_layers.append(nn.Linear(prev_size, fc_size))
+            self.fc_layers.append(nn.ReLU())
+            prev_size = fc_size
+        
+        self.fc_layers.append(nn.Linear(prev_size, self.num_classes))
+
     def forward(
         self,
         input_ids,
-        token_type_ids,
-        attention_mask,
         related_features,
+        token_type_ids=None,
+        attention_mask=None,
         labels=None,
         **kwargs
     ):
@@ -54,14 +58,25 @@ class CustomedModel(PreTrainedModel):
                     attention_mask=attention_mask,
                     labels=labels)
         encoder_logits = encoder_outputs["logits"] # shape = (batch, 1)
-        features = torch.cat((encoder_logits,related_features), 1)
+        logits = torch.cat((encoder_logits,related_features), 1)
         
-        logits = self.fc_layers(features)
+        for layer in self.fc_layers:
+            logits = layer(logits)
         
         return CustomedOutput(
             logits=logits,
             encoder_logits=encoder_logits
         )
-        
 
+    def from_pretrained(self, 
+        checkpoint, 
+        num_classes=1,
+        related_features_dim=14,
+        fc_layers=[1024]):
+        self.num_classes = num_classes
+        self.related_features_dim = related_features_dim
+        self.fc_layers_size = fc_layers
+        self._init(os.path.join(checkpoint, "encoder"))
+        self.fc_layers.load_state_dict(torch.load(os.path.join(checkpoint, "fc_layers.bin")))
 
+        return self

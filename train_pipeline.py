@@ -14,11 +14,17 @@ import math
 from pathlib import Path
 from datetime import datetime
 
-from model import CustomedModel, CustomedConfig
+from model import CustomedModel
 
 import wandb
 
 from tqdm import trange
+
+from sklearn.preprocessing import PowerTransformer
+
+from typing import Optional
+
+import os
 
 COL_NAMES = ['Danceability', 'Energy', 'Key', 'Loudness', 'Speechiness', 'Acousticness', 'Instrumentalness', 'Liveness', 'Valence', 'Tempo', 'Duration_ms', 'Views', 'Likes', 'Stream', 'Album_type', 'Licensed', 'official_video', 'id', 'Track', 'Album', 'Uri', 'Url_spotify', 'Url_youtube', 'Comments', 'Description', 'Title', 'Channel', 'Composer', 'Artist']
 ID = 'id'
@@ -48,15 +54,14 @@ def parse_args() -> Namespace:
         help="Directory to save the model file.",
         default="./models/",
     )
-    parser.add_argument("--only_eval", action="store_true")
+    parser.add_argument("--only_test", action="store_true")
     parser.add_argument("--num_proc", type=int, default=2)
     
     # Training arguments
-    parser.add_argument("--encoder_model", type=str, default="bert-base-uncased")
-    parser.add_argument("--encoder_checkpoint", type=str, default=None)
+    parser.add_argument("--encoder_name_or_path", type=str, default="bert-base-uncased")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--lr", type=float, default=3e-5)
-    parser.add_argument("--max_length", type=float, default=256)
+    parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--epoch", type=int, default=20)
     args = parser.parse_args()
@@ -66,14 +71,23 @@ def read_data(args):
     train_data = pd.read_csv(args.train_file, encoding = 'utf-8')
     test_data = pd.read_csv(args.test_file, encoding = 'utf-8')
 
+    pt = PowerTransformer()
     # Replace all NaN with mean value of that column in training data
     for name in NUM_COL_NAMES:
+        # Data transform
         # Normalization
         test_data[name] = (test_data[name]-train_data[name].mean())/train_data[name].std()
         train_data[name] = (train_data[name]-train_data[name].mean())/train_data[name].std()
 
-        test_data[name] = test_data[name].fillna(test_data[name].mean())
-        train_data[name] = train_data[name].fillna(train_data[name].mean())
+        test_data[name] = test_data[name].fillna(0.)
+        train_data[name] = train_data[name].fillna(0.)
+
+        # Power Transform
+        test_2d_arr = pt.fit_transform(test_data[name].to_numpy().reshape(-1,1))
+        train_2d_arr = pt.fit_transform(train_data[name].to_numpy().reshape(-1,1))
+        
+        test_data[name] = pd.Series(test_2d_arr.reshape(-1))
+        train_data[name] = pd.Series(train_2d_arr.reshape(-1))
     
     for name in STR_COL_NAMES:
         test_data[name] = test_data[name].fillna("nan")
@@ -87,17 +101,17 @@ def read_data(args):
 
     test_data[ID] = test_data[ID].astype("int32")
     return train_data, test_data
-    
+     
 def preprocess_function(examples, tokenizer, max_length):
     # TODO: Test with different prompt.
-    text = examples["Description"]
+    # text = examples["Description"]
     ############
     #  Prompt  #
     ############
-    # col_names = STR_COL_NAMES 
-    # text = ""
-    # for name in col_names:
-    #     text += f'{name}: {examples[name]}. '
+    col_names = STR_COL_NAMES 
+    text = ""
+    for name in col_names:
+        text += f'{name}: {examples[name]}. '
     
     processed_examples = tokenizer(text, truncation=True, padding="max_length", max_length=max_length)
     processed_examples["text"] = text
@@ -133,6 +147,17 @@ class RegressionTrainer(Trainer):
         logits = outputs["logits"][:, 0]
         loss = torch.nn.functional.mse_loss(logits, labels)
         return (loss, outputs) if return_outputs else loss
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        print(f"Saving model checkpoint to {output_dir}")
+
+        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+
+        # Save a trained model and configuration using `save_pretrained()`.
+        # They can then be reloaded using `from_pretrained()`
+        self.model.encoder.save_pretrained(os.path.join(output_dir, "encoder"))
+        torch.save(self.model.fc_layers.state_dict(), os.path.join(output_dir, "fc_layers.bin"))
+        
 
 def main(args):
     ##########
@@ -154,14 +179,14 @@ def main(args):
     ###########
     #  Model  #
     ###########
-    tokenizer = AutoTokenizer.from_pretrained(args.encoder_model)
+    tokenizer = AutoTokenizer.from_pretrained(args.encoder_name_or_path)
+    
     if args.checkpoint is None:
-        model_path = args.encoder_model if args.encoder_checkpoint is None else args.encoder_checkpoint
-        model = CustomedModel(CustomedConfig(encoder_model_path=model_path, related_features_dim=len(NUM_COL_NAMES)))
+        model = CustomedModel(encoder_name_or_path=args.encoder_name_or_path, num_classes=1, related_features_dim=len(NUM_COL_NAMES))
     else:
-        config = CustomedConfig.from_pretrained(args.checkpoint)
-        model = CustomedModel(config)
-        
+        print(f"Load from checkpoint: {args.checkpoint}")
+        model = CustomedModel().from_pretrained(args.checkpoint, num_classes=1, related_features_dim=len(NUM_COL_NAMES))
+    
     for split in ds:
         print(f"Mapping {split} split.")
         ds[split] = ds[split].map(
@@ -188,6 +213,7 @@ def main(args):
         load_best_model_at_end=True,
         weight_decay=0.01,
     )
+    
     trainer = RegressionTrainer(
         model=model,
         args=training_args,
@@ -195,7 +221,9 @@ def main(args):
         eval_dataset=ds["validation"],
         compute_metrics=compute_metrics_for_regression,
     )
-    if not args.only_eval:
+    
+    
+    if not args.only_test:
         trainer.train()
 
     ####################
@@ -208,14 +236,22 @@ def main(args):
     nb_batches = math.ceil(len(ds["test"])/args.batch)
     y_preds = []
 
-    for i in range(nb_batches):
-        inputs = ds["test"][i * args.batch: (i+1) * args.batch]
-        y_preds += model(**inputs).logits.reshape(-1).tolist()
+    for i in trange(nb_batches):
+        input_texts = ds["test"][i * args.batch: (i+1) * args.batch]["text"]
+        # input_labels = raw_test_ds[i * args.batch: (i+1) * args.batch][LABEL]
+        encoded = tokenizer(input_texts, truncation=True, padding="max_length", max_length=256, return_tensors="pt").to("cuda")
+        tmp = model(**encoded, related_features=torch.tensor(ds["test"][i * args.batch: (i+1) * args.batch]['related_features']).to('cuda')).logits.reshape(-1).tolist()
+        for idx in range(len(tmp)):
+            if tmp[idx] > 9:
+                tmp[idx] = 9
+            if tmp[idx] < 0:
+                tmp[idx] = 0
+        y_preds += tmp
 
-    df = pd.DataFrame([ds["test"][ID], y_preds], [ID, "Prediction"]).T
+    df = pd.DataFrame([ds["test"][ID], y_preds], [ID, LABEL]).T
     df[ID] = df[ID].apply(round) 
-    df[LABEL] = df["Prediction"].apply(round) 
-    df.drop("Prediction", axis=1, inplace=True)
+    # df[LABEL] = df["Prediction"].apply(round) 
+    # df.drop("Prediction", axis=1, inplace=True)
     df.to_csv(args.repo_dir / "pred.csv", index=False)
 
 if __name__ == "__main__":
