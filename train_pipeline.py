@@ -35,6 +35,13 @@ STR_COL_NAMES = ["Description", "Artist", "Composer", "Album", "Track"]
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Set the random seed for PyTorch
+random_seed = 42
+torch.manual_seed(random_seed)
+torch.cuda.manual_seed_all(random_seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 def parse_args() -> Namespace:
     parser = ArgumentParser()
     # Data
@@ -54,16 +61,19 @@ def parse_args() -> Namespace:
         help="Directory to save the model file.",
         default="./models/",
     )
+    parser.add_argument("--only_eval", action="store_true")
     parser.add_argument("--only_test", action="store_true")
     parser.add_argument("--num_proc", type=int, default=2)
     
     # Training arguments
     parser.add_argument("--encoder_name_or_path", type=str, default="bert-base-uncased")
+    parser.add_argument("--tokenizer_name_or_path", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--epoch", type=int, default=20)
+    parser.add_argument("--fc_layers", type=int, default=[1024], nargs='+')
     args = parser.parse_args()
     return args
 
@@ -151,6 +161,7 @@ class RegressionTrainer(Trainer):
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         print(f"Saving model checkpoint to {output_dir}")
 
+        os.makedirs(output_dir, exist_ok=True)
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
 
         # Save a trained model and configuration using `save_pretrained()`.
@@ -160,6 +171,7 @@ class RegressionTrainer(Trainer):
         
 
 def main(args):
+    print(args)
     ##########
     #  Data  #
     ##########
@@ -170,7 +182,7 @@ def main(args):
     train_data, test_data = read_data(args)
     raw_train_ds, raw_test_ds = Dataset.from_pandas(train_data, split="train"), Dataset.from_pandas(test_data, split="test")
     
-    raw_split_ds = raw_train_ds.train_test_split(test_size=0.1)
+    raw_split_ds = raw_train_ds.train_test_split(test_size=0.1, seed=random_seed)
     
     ds = { "train": raw_split_ds["train"], 
             "validation": raw_split_ds["test"], 
@@ -179,13 +191,14 @@ def main(args):
     ###########
     #  Model  #
     ###########
-    tokenizer = AutoTokenizer.from_pretrained(args.encoder_name_or_path)
+    tokenizer_path = args.encoder_name_or_path if args.tokenizer_name_or_path is None else args.tokenizer_name_or_path
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     
     if args.checkpoint is None:
-        model = CustomedModel(encoder_name_or_path=args.encoder_name_or_path, num_classes=1, related_features_dim=len(NUM_COL_NAMES))
+        model = CustomedModel(encoder_name_or_path=args.encoder_name_or_path, num_classes=1, related_features_dim=len(NUM_COL_NAMES), fc_layers=args.fc_layers)
     else:
         print(f"Load from checkpoint: {args.checkpoint}")
-        model = CustomedModel().from_pretrained(args.checkpoint, num_classes=1, related_features_dim=len(NUM_COL_NAMES))
+        model = CustomedModel().from_pretrained(args.checkpoint, num_classes=1, related_features_dim=len(NUM_COL_NAMES), fc_layers=args.fc_layers)
     
     for split in ds:
         print(f"Mapping {split} split.")
@@ -211,6 +224,7 @@ def main(args):
         save_total_limit=2,
         metric_for_best_model="accuracy",
         load_best_model_at_end=True,
+        save_on_each_node=True, # Set for load_best_model_at_end
         weight_decay=0.01,
     )
     
@@ -223,24 +237,25 @@ def main(args):
     )
     
     
-    if not args.only_test:
+    if not args.only_test and not args.only_eval:
         trainer.train()
 
     ####################
     #  Test Statistic  #
     ####################
-    trainer.eval_dataset=ds["test"]
+    if not args.only_eval:
+        trainer.eval_dataset=ds["test"]
     trainer.evaluate()
 
     # Output prediction
-    nb_batches = math.ceil(len(ds["test"])/args.batch)
+    nb_batches = math.ceil(len(trainer.eval_dataset)/args.batch)
     y_preds = []
 
     for i in trange(nb_batches):
-        input_texts = ds["test"][i * args.batch: (i+1) * args.batch]["text"]
+        input_texts = trainer.eval_dataset[i * args.batch: (i+1) * args.batch]["text"]
         # input_labels = raw_test_ds[i * args.batch: (i+1) * args.batch][LABEL]
         encoded = tokenizer(input_texts, truncation=True, padding="max_length", max_length=256, return_tensors="pt").to("cuda")
-        tmp = model(**encoded, related_features=torch.tensor(ds["test"][i * args.batch: (i+1) * args.batch]['related_features']).to('cuda')).logits.reshape(-1).tolist()
+        tmp = model(**encoded, related_features=torch.tensor(trainer.eval_dataset[i * args.batch: (i+1) * args.batch]['related_features']).to('cuda')).logits.reshape(-1).tolist()
         for idx in range(len(tmp)):
             if tmp[idx] > 9:
                 tmp[idx] = 9
@@ -248,7 +263,7 @@ def main(args):
                 tmp[idx] = 0
         y_preds += tmp
 
-    df = pd.DataFrame([ds["test"][ID], y_preds], [ID, LABEL]).T
+    df = pd.DataFrame([trainer.eval_dataset[ID], y_preds], [ID, LABEL]).T
     df[ID] = df[ID].apply(round) 
     # df[LABEL] = df["Prediction"].apply(round) 
     # df.drop("Prediction", axis=1, inplace=True)

@@ -14,6 +14,8 @@ from datetime import datetime
 
 import wandb
 
+from sklearn.preprocessing import PowerTransformer
+
 COL_NAMES = ['Danceability', 'Energy', 'Key', 'Loudness', 'Speechiness', 'Acousticness', 'Instrumentalness', 'Liveness', 'Valence', 'Tempo', 'Duration_ms', 'Views', 'Likes', 'Stream', 'Album_type', 'Licensed', 'official_video', 'id', 'Track', 'Album', 'Uri', 'Url_spotify', 'Url_youtube', 'Comments', 'Description', 'Title', 'Channel', 'Composer', 'Artist']
 ID = 'id'
 LABEL = 'Danceability'
@@ -46,7 +48,7 @@ def parse_args() -> Namespace:
     parser.add_argument("--base_model", type=str, default="bert-base-uncased")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--lr", type=float, default=3e-5)
-    parser.add_argument("--max_length", type=float, default=256)
+    parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--epoch", type=int, default=20)
     args = parser.parse_args()
@@ -56,14 +58,25 @@ def read_data(args):
     train_data = pd.read_csv(args.train_file, encoding = 'utf-8')
     test_data = pd.read_csv(args.test_file, encoding = 'utf-8')
 
+    pt = PowerTransformer()
+
     # Replace all NaN with mean value of that column in training data
     for name in NUM_COL_NAMES:
+        # Normalization
+        # Data transform
         # Normalization
         test_data[name] = (test_data[name]-train_data[name].mean())/train_data[name].std()
         train_data[name] = (train_data[name]-train_data[name].mean())/train_data[name].std()
 
-        test_data[name] = test_data[name].fillna(test_data[name].mean())
-        train_data[name] = train_data[name].fillna(train_data[name].mean())
+        test_data[name] = test_data[name].fillna(0.)
+        train_data[name] = train_data[name].fillna(0.)
+
+        # Power Transform
+        test_2d_arr = pt.fit_transform(test_data[name].to_numpy().reshape(-1,1))
+        train_2d_arr = pt.fit_transform(train_data[name].to_numpy().reshape(-1,1))
+        
+        test_data[name] = pd.Series(test_2d_arr.reshape(-1))
+        train_data[name] = pd.Series(train_2d_arr.reshape(-1))
     
     for name in STR_COL_NAMES:
         test_data[name] = test_data[name].fillna("nan")
@@ -80,14 +93,14 @@ def read_data(args):
     
 def preprocess_function(examples, tokenizer, max_length):
     # TODO: Test with different prompt.
-    text = examples["Description"]
+    # text = examples["Description"]
     ############
     #  Prompt  #
     ############
-    # col_names = STR_COL_NAMES 
-    # text = ""
-    # for name in col_names:
-    #     text += f'{name}: {examples[name]}. '
+    col_names = STR_COL_NAMES 
+    text = ""
+    for name in col_names:
+        text += f'{name}: {examples[name]}. '
     
     processed_examples = tokenizer(text, truncation=True, padding="max_length", max_length=max_length)
     processed_examples["text"] = text
